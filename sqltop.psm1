@@ -70,8 +70,8 @@ function Invoke-SqlTop {
         $StateData.Password = $Credential.GetNetworkCredential().password
         $StateData.SqlAuth = $True
 
-        Write-Verbse "    User: $($StateData.UserName)"
-        Write-Verbse "Password: $($StateData.Password)"
+        Write-Verbose "    User: $($StateData.UserName)"
+        Write-Verbose "Password: $($StateData.Password)"
     }
 
     # Set some starting variables
@@ -475,62 +475,72 @@ function Invoke-SqlTop {
     SET CONCAT_NULL_YIELDS_NULL ON
     SET ARITHABORT ON
     
-    SELECT
-        sp.spid AS spid,
-        sp.ecid AS ecid,
-        sp.blocked AS block,
-        ISNULL(DATEDIFF(second,er.start_time,GETDATE()),0) AS dur_sec,
-        CASE sp.status
-        WHEN 'pending' THEN 0
-        WHEN 'running' THEN 1
-        WHEN 'runnable' THEN 2
-        WHEN 'spinloop' THEN 3
-        WHEN 'rollback' THEN 4
-        WHEN 'suspended' THEN 5
-        WHEN 'background' THEN 6
-        ELSE 7
-        END as status_id,
-        RTRIM(sp.status) AS status,
-        RTRIM(sp.hostname) AS hostname,
-        DB_NAME(sp.dbid) AS [database],
-        CAST(sp.hostprocess AS BIGINT) AS host_pid,
-        sp.waittime AS wt_ms,
-        SUM(sp.waittime) OVER( PARTITION BY spid ORDER BY (SELECT NULL) ) AS group_wait,
-        RTRIM(sp.lastwaittype) As wt_type,
-        RTRIM(sp.waitresource) as wt_rsrc,
-        sp.cpu,
-        sp.memusage / 128.0 AS mem_mb,
-        sp.physical_io AS pread_mb,
-        ISNULL(su.tempdb_mb,0) AS tempdb_mb,
-        ISNULL(er.logical_reads,0)/128.0 AS lread_mb,
-        ISNULL(snapshot_transaction.is_snapshot,0) AS ss,
-        sp.open_tran,
-        NULLIF(RTRIM(sp.nt_domain) + '\' + RTRIM(sp.nt_username),'\') AS [user],
-        RTRIM(sp.program_name) AS program_name,
-        RTRIM(sp.cmd) AS command,
-        er.plan_handle,
-        er.statement_sql_handle,
-        ISNULL(object_schema_name(ps.object_id,ps.database_id) + '.' + object_name(ps.object_id,ps.database_id),'No associated proc') AS [proc_name],
-        getutcdate() AS collection_time_utc
-    FROM	sys.sysprocesses AS sp WITH(NOLOCK)
-            OUTER APPLY ( 
-                SELECT SUM(su.user_objects_alloc_page_count + su.internal_objects_alloc_page_count) / 128.0 AS tempdb_mb
-                FROM sys.dm_db_task_space_usage AS su WITH(NOLOCK)
-                WHERE sp.spid = su.session_id
-            ) AS su
-            LEFT OUTER JOIN sys.dm_exec_requests AS er WITH(NOLOCK)
-                ON sp.spid = er.session_id
-                AND er.scheduler_id IN ( SELECT scheduler_id FROM sys.dm_os_schedulers WHERE status = 'VISIBLE ONLINE' )
+    SELECT  es.session_id AS [spid],
+            es.is_user_process AS [is_user],
+            ISNULL(t.exec_context_id,0) AS [ecid],
+            ISNULL(er.blocking_session_id,0) AS [block],
+            ISNULL(DATEDIFF(second,er.start_time,GETDATE()),0) AS dur_sec,
+            CASE t.task_state
+            WHEN 'pending' THEN 0
+            WHEN 'running' THEN 1
+            WHEN 'runnable' THEN 2
+            WHEN 'spinloop' THEN 3
+            WHEN 'rollback' THEN 4
+            WHEN 'suspended' THEN 5
+            WHEN 'background' THEN 6
+            ELSE 7
+            END as status_id,
+            t.task_state AS [status],
+            ISNULL(es.host_name,'') AS [hostname],
+            DB_NAME(es.database_id) AS [database],
+            ISNULL(es.host_process_id,0) AS [host_pid],
+            waits.wait_duration_ms AS wt_ms,
+            SUM(waits.wait_duration_ms) OVER( PARTITION BY t.session_id ORDER BY (SELECT NULL) ) AS group_wait,
+            waits.wait_type AS wt_type,
+            ISNULL(waits.resource_description,'') AS wt_rsrc,
+            ISNULL(er.cpu_time,0) AS [cpu],
+            ISNULL(er.logical_reads /128.0,0) AS lread_mb,
+            su.tempdb_mb,
+            ISNULL(er.open_transaction_count,0) AS open_tran,
+            es.login_name AS [user],
+            ISNULL(es.program_name,'') AS [program_name],
+            er.command,
+            ISNULL(mg.granted_memory_kb / 1024.0,0.0) mem_mb,
+            mg.query_cost,
+            er.plan_handle,
+            er.statement_sql_handle,
+            ISNULL(object_schema_name(ps.object_id,ps.database_id) + '.' + object_name(ps.object_id,ps.database_id),'No associated proc') AS [proc_name],
+            getutcdate() AS collection_time_utc		
+    FROM    sys.dm_exec_sessions AS es
+            INNER JOIN sys.dm_os_tasks AS t
+                ON es.session_id = t.session_id
+            LEFT OUTER JOIN sys.dm_exec_requests AS er
+                ON t.task_address = er.task_address
+            LEFT OUTER JOIN sys.dm_os_workers AS w
+                ON t.worker_address = w.worker_address
+            LEFT OUTER JOIN sys.dm_exec_query_memory_grants AS mg
+                ON er.session_id = mg.session_id
             OUTER APPLY (
-                SELECT CAST(is_snapshot AS INT) AS is_snapshot FROM sys.dm_tran_active_snapshot_database_transactions AS sst WHERE sst.session_id = sp.spid
-            ) AS snapshot_transaction
+                SELECT  wt.waiting_task_address,
+                        wt.wait_type,
+                        wt.resource_description,
+                        max(wait_duration_ms) AS wait_duration_ms
+                FROM    sys.dm_os_waiting_tasks AS wt
+                WHERE   wt.waiting_task_address = t.task_address
+                GROUP BY
+                        waiting_task_address,
+                        wait_type,
+                        resource_description
+            ) AS waits
+            OUTER APPLY ( 
+                    SELECT ISNULL(SUM(su.user_objects_alloc_page_count + su.internal_objects_alloc_page_count),0) / 128.0 AS tempdb_mb
+                    FROM sys.dm_db_task_space_usage AS su WITH(NOLOCK)
+                    WHERE su.task_address = t.task_address
+            ) AS su
             LEFT OUTER JOIN sys.dm_exec_procedure_stats AS ps WITH(NOLOCK)
                 ON er.plan_handle = ps.plan_handle
-    WHERE	sp.spid <> @@SPID
-            AND (
-                NOT ( sp.lastwaittype = 'MISCELLANEOUS' AND sp.open_tran = 0 )
-                OR su.tempdb_mb > 0
-            )
+    WHERE	es.session_id <> @@SPID -- Filter out the current SPID
+
 "@
         
         [string]$GetExecPlan_Query = @'
@@ -601,18 +611,30 @@ function Invoke-SqlTop {
                 }
 
                 $Blockers = $Results | Select-Object -ExpandProperty block -Unique
+
                 # Capture parallel spids, this is used later to make sure we display ALL workers for a given spid
-                $ParallelSpids = $Results | Where-Object { $_.ecid -and $_.ecid -gt 0 } | Select-Object -ExpandProperty spid -Unique
+                $ParallelSpids = $Results | Where-Object { $_.ecid -eq 1 } | Select-Object -ExpandProperty spid -Unique
     
                 $Results | Add-Member -MemberType NoteProperty -Name 'group_status' -Value -1 -Force
                 $Results | Add-Member -MemberType NoteProperty -Name 'x' -Value [string]'' -Force
     
+                # Here we add both an identifier if a worker is a child or not, as well as tagging 
                 for ($i = 0; $i -lt $Results.Count; $i++) {
-                    if ($Results[$i].ecid -gt 0) {
-                        $Results[$i].x = ' --> '
-                        $Results[$i].group_status = [int]($($Results | Where-Object { $_.spid -eq $Results[$i].spid -and $_.ecid -eq 0 } | Select-Object -ExpandProperty status_id -First 1))
+                    if ( $Results[$i].spid -in $Blockers -and $Results[$i].block -eq 0 ) {
+                        $Results[$i].x = 'b '
+                    } elseif ( $Results[$i].is_user -eq 1 ) {
+                        $Results[$i].x = ' '
                     } else {
-                        $Results[$i].x = '-'
+                        $Results[$i].x = 's '
+                    }
+                    
+                    if ($Results[$i].ecid -gt 0) {
+                        $Results[$i].x += ' --> '
+                        $Results[$i].group_status = [int]($($Results | Where-Object { $_.spid -eq $Results[$i].spid -and $_.ecid -eq 0 } | Select-Object -ExpandProperty status_id -First 1))
+                    } elseif ( $Results[$i].spid -in $ParallelSpids ) {
+                        $Results[$i].x += '--   '
+                        $Results[$i].group_status = $Results[$i].status_id
+                    } else {
                         $Results[$i].group_status = $Results[$i].status_id
                     }
     
@@ -626,10 +648,6 @@ function Invoke-SqlTop {
                     $BlockingChains = $Results | Where-Object { $_.block -ne 0 -or $_.spid -in $Blockers}
                     
                     $BlockingChains | ForEach-Object {
-                        #if ( $_.block -eq 0 ) {
-                        #    $_.blockingchain += $_.spid
-                        #}
-    
                         $_.blockingchain += $_.block
                         $block = $_.block
                         while($block) {
@@ -637,14 +655,14 @@ function Invoke-SqlTop {
                             $_.blockingchain += $block
                         }
                     
-                        #$_.blockingchain = $_.blockingchain | Where-Object { $_ -ne 0 }
-                
                         if ( $_.block -eq 0 ) {
                             $_.x = ' |'
                         } else {
                             $_.x = '+-'.PadLeft($($_.blockingchain.count+2),' ')
                         }
                         [array]::Reverse($_.blockingchain)
+
+                        $_.blockingchain += $_.spid
                     }
     
                     $StateData.PrevResults = $StateData.Results
@@ -655,16 +673,19 @@ function Invoke-SqlTop {
                 } else {
                     $StateData.PrevResults = $StateData.Results
                     $StateData.Results = $Results | Where-Object {
-                        $_.open_tran -gt 0 `
-                        -or ( 
-                            $_.status -notin ('background','sleeping','suspended','dormant')
-                        ) -or (
-                            $_.spid -in $Blockers
-                        ) -or (
-                            $_.spid -in $ParallelSpids
-                        ) -or (
-                            $_.tempdb_mb -gt 0
-                        )
+                        # Filtering the results
+                        (
+                            $_.open_tran -ne 0 `
+                            -or (
+                                $_.spid -in $Blockers
+                            ) -or (
+                                $_.spid -in $ParallelSpids
+                            ) -or (
+                                $_.tempdb_mb -ne 0
+                            ) -or (
+                                $_.state -eq 'RUNNING'
+                            )
+                        ) -and $_.command -ne 'UNKNOWN TOKEN'
                     }
                     $StateData.Error = $null
                     $StateData.Updated = Get-Date
@@ -718,7 +739,7 @@ function Invoke-SqlTop {
                     Start-Sleep -Milliseconds 100
                 }
             } catch {
-                $StateData.Error = "$($_.Exception | Out-String)"
+                $StateData.Error = "$($_.Exception | Select * | Out-String)"
                 $StateData.Connection.Close()
                 $StateData.Reset = $True
             } finally {
@@ -743,13 +764,12 @@ function Invoke-SqlTop {
         Write-Host "." -NoNewline
         Start-Sleep -Milliseconds 500
     }
+    
+    Clear-Host
 
     # Start the UI loop
     while(1){
         try {
-            # clear the screen
-            Clear-Host
-
             # Calculate how old the results are
             $UpdateAge = ((Get-Date) - ($StateData.Updated)).TotalSeconds
             
@@ -758,10 +778,18 @@ function Invoke-SqlTop {
 
             # Lock the statedata, this pauses the data refresh while the UI is rendering to prevent the refresh thread from updating the data while it is being drawn
             $StateData.Lock = $True
-            $max_display = $Host.UI.RawUI.WindowSize.Height - 16
+            $max_display = $Host.UI.RawUI.WindowSize.Height - 20
             if ( $Debug ) { $max_display = $max_display - 20 }
             if ( $UpdateAge -gt 20 ) { $SlowUpdates = $True } else { $SlowUpdates = $False } 
             $process_count = ($StateData.Results | Measure-Object).Count
+
+            # Reset the cursor
+            [Console]::CursorVisible = $False
+            $host.UI.RawUI.CursorPosition = @{X=0;Y=0}
+            $Blanks = ' '.PadRight(7 * ($Host.UI.RawUI.WindowSize.Width))
+            [Console]::Write($Blanks)
+            $host.UI.RawUI.CursorPosition = @{X=0;Y=0}
+
             # -------- DRAW THE HEADER -------- #
             Write-Host "           Instance: $($StateData.SqlInstance)$(if ( -not $IsLinux ){", CPU: $($StateData.cpu)%"})"
             Write-Host "          Processes: captured - $($process_count) $(if ($max_display -lt $($process_count)) { ", displaying - $($max_display)" } ), blocking - $($StateData.Results | Where-Object { $_.block -gt 0 } | Measure-Object | Select-Object -ExpandProperty Count)"
@@ -774,11 +802,13 @@ function Invoke-SqlTop {
             Write-Host "$("MODE: $($StateData.DisplayMode.ToUpper()) $($SubDisplayMode)".PadRight($Host.UI.RawUI.WindowSize.Width))`n" -BackgroundColor Green -ForegroundColor Black -NoNewline
             # --------------------------------- #
             $ResultString = ""
-
+                  
             # -------- WRITE OUT DEBUG DATA -------- #
             if ( $Debug ) { Write-Host "*** DEBUG DATA ***" -BackgroundColor Red }
             if ( $Debug ) { $StateData | Out-String; $DataRefresh | Out-String;}
             # -------------------------------------- #
+
+            $CurrY = $host.UI.RawUI.CursorPosition.Y
 
             # -------- WRITE OUT RESULTS -------- #
             # Default message if the results are empty
@@ -862,10 +892,14 @@ function Invoke-SqlTop {
                 } else {
                     $StateData.Results
                 }) | Sort-Object -Property $SortOpt | Select-Object -First $max_display | `
-                    Format-Table -Property $DisplayOpt -Wrap | Out-String -Width $Host.UI.RawUI.WindowSize.Width -Stream | ForEach-Object {
+                    Format-Table -Property $DisplayOpt | Out-String -Width $Host.UI.RawUI.WindowSize.Width -Stream | ForEach-Object {
                         # Handle special coloring here
                         $Row += 1
-                        if ( $filter -and -not $StateData.SpidFilter -and $_.ToLower().Contains("$($filter.ToLower())") ) {
+                        if  ( $_ -match '^s .*' ) {
+                            $ResultString += "$(color $_ "yellow" "default")`n"
+                        } elseif  ( $_ -match '^b .*' ) {
+                            $ResultString += "$(color $_ "red" "default")`n"
+                        }elseif ( $filter -and -not $StateData.SpidFilter -and $_.ToLower().Contains("$($filter.ToLower())") ) {
                             $ResultString += "$(color $_ "black" "white")`n"
                         } elseif ( $Row % 2 -eq 1 ) { 
                             $ResultString += "$(color $_ "cyan" "default")`n"
@@ -874,7 +908,12 @@ function Invoke-SqlTop {
                         }
                     }
                 $Row = 0
-                $ResultString
+                
+                # Write some spaces to clear this portion of the screen and re-draw over it
+                $Blanks = ' '.PadRight(($lastY + 4) * ($Host.UI.RawUI.WindowSize.Width))
+                [Console]::Write($Blanks)
+                $host.UI.RawUI.CursorPosition = @{X=0;Y=$CurrY}
+                [Console]::Writeline($ResultString)
                 $Host.UI.RawUI.WindowTitle = "SQLTop - $($StateData.SqlInstance) - Processes: $($StateData.Results.Count) Blocked: $($StateData.Results | Where-Object { $_.block -gt 0 } | Measure-Object | Select-Object -ExpandProperty Count) CPU: $($StateData.cpu)% - Updated: $($StateData.Updated)"
             }
 
@@ -891,6 +930,7 @@ function Invoke-SqlTop {
                 Pause
             }
 
+            $lastY = $host.UI.RawUI.CursorPosition.Y
             # We are done rendering so we lift the refresh lock
             $StateData.HasNewData = $False
             $StateData.Lock = $False            
@@ -906,7 +946,9 @@ function Invoke-SqlTop {
             } else {
                 Write-Host "Commands: [$(color "s" "green")]pid to track/[$(color "t" "green")]ext to highlight/[$(color "p" "green")]ause output/display [$(color "m" "green")]ode/[$(color "q" "green")]uit/[$(color "C" "green")]hange server`n> " -NoNewline
             }
-            
+
+            # bring the cursor back
+            [Console]::CursorVisible = $True
             # Loop for the interval defined in UI_refresh_sec
             $StartSleep = Get-Date
             while ( ((Get-Date) - $StartSleep).TotalSeconds -le $UI_refresh_sec ) {
