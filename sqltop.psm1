@@ -778,8 +778,7 @@ function Invoke-SqlTop {
 
             # Lock the statedata, this pauses the data refresh while the UI is rendering to prevent the refresh thread from updating the data while it is being drawn
             $StateData.Lock = $True
-            $max_display = $Host.UI.RawUI.WindowSize.Height - 20
-            if ( $Debug ) { $max_display = $max_display - 20 }
+            $max_display = $Host.UI.RawUI.WindowSize.Height - 16
             if ( $UpdateAge -gt 20 ) { $SlowUpdates = $True } else { $SlowUpdates = $False } 
             $process_count = ($StateData.Results | Measure-Object).Count
 
@@ -799,7 +798,7 @@ function Invoke-SqlTop {
             Write-Host "$($StateData.DataRefreshSec) sec." -ForegroundColor "$(if ( $StateData.DataRefreshSec -ne $StateData.DataRefreshDefaultSec ) { "yellow" } else { "green" } )"
             Write-Host "   Highlighted Text: $($filter)"
             Write-Host "        Filter Spid: $($StateData.SpidFilter)"
-            Write-Host "$("MODE: $($StateData.DisplayMode.ToUpper()) $($SubDisplayMode)".PadRight($Host.UI.RawUI.WindowSize.Width))`n" -BackgroundColor Green -ForegroundColor Black -NoNewline
+            Write-Host "$("MODE: $($StateData.DisplayMode.ToUpper()) $($SubDisplayMode)".PadRight($Host.UI.RawUI.WindowSize.Width))`n" -BackgroundColor Green -ForegroundColor Black
             # --------------------------------- #
             $ResultString = ""
                   
@@ -808,8 +807,7 @@ function Invoke-SqlTop {
             if ( $Debug ) { $StateData | Out-String; $DataRefresh | Out-String;}
             # -------------------------------------- #
 
-            $CurrY = $host.UI.RawUI.CursorPosition.Y
-
+            $CurrY = $host.UI.RawUI.CursorPosition.Y - 1
             # -------- WRITE OUT RESULTS -------- #
             # Default message if the results are empty
             if (-not $StateData.Results) { Write-Host "No sessions/blockers found, or waiting for additional data..."; $StateData.Lock = $False }
@@ -910,7 +908,7 @@ function Invoke-SqlTop {
                 $Row = 0
                 
                 # Write some spaces to clear this portion of the screen and re-draw over it
-                $Blanks = ' '.PadRight(($lastY + 4) * ($Host.UI.RawUI.WindowSize.Width))
+                $Blanks = ' '.PadRight(($Host.UI.RawUI.WindowSize.Height - $CurrY - 1) * ($Host.UI.RawUI.WindowSize.Width))
                 [Console]::Write($Blanks)
                 $host.UI.RawUI.CursorPosition = @{X=0;Y=$CurrY}
                 [Console]::Writeline($ResultString)
@@ -1010,7 +1008,7 @@ SQLTOP utilizes the sys.sysprocesses DMV. This is one of the only ways you can g
                             }
                             break
                         } elseif ( $key -eq 'q' ) {
-                            Write-Host "`nExiting..." -ForegroundColor Red
+                            Write-Host "`nQuiters never win..." -ForegroundColor Red
                             $StateData.Run = $False
                             $DataRefresh = $null
                             $Host.UI.RawUI.WindowTitle = $OldTitle
